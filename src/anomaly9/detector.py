@@ -146,7 +146,8 @@ def run_bls(
             n_in = int(in_mask.sum())
             n_out = n - n_in
             best_power[k] = max_pow
-            best_depth[k] = mean_in - mean_out
+            # Transit depth as positive value (flux drop below baseline): out - in
+            best_depth[k] = mean_out - mean_in
             best_dur[k] = durations_d[max_idx]
             best_frac[k] = wfrac
             # chi^2 reduction of the box model vs a flat line (in units of sigma)

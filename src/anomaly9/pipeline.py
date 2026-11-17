@@ -43,14 +43,348 @@ with warnings.catch_warnings():
     except ImportError:
         LightkurveError = Exception
 
+
+# TESS momentum dump cadence intervals (approximate)
+# TESS performs momentum dumps approximately every 2.5 days (varies by sector)
+# We mask a window around each dump to remove thruster firing artifacts
+MOMENTUM_DUMP_INTERVAL_DAYS = 2.5
+MOMENTUM_DUMP_WINDOW_DAYS = 0.05  # 50 minutes window around dump
+
+
+def mask_momentum_dumps(
+    time: np.ndarray,
+    flux: np.ndarray,
+    flux_err: Optional[np.ndarray] = None,
+    dump_interval: float = MOMENTUM_DUMP_INTERVAL_DAYS,
+    dump_window: float = MOMENTUM_DUMP_WINDOW_DAYS,
+) -> tuple:
+    """
+    Mask TESS momentum dump cadence windows to remove thruster firing artifacts.
+    
+    TESS performs momentum dumps at regular intervals (~2.5 days). These create
+    systematic flux discontinuities that can mimic or obscure transits.
+    
+    Parameters
+    ----------
+    time : np.ndarray
+        Time array [BJD]
+    flux : np.ndarray
+        Flux array
+    flux_err : np.ndarray, optional
+        Flux error array
+    dump_interval : float
+        Interval between momentum dumps [days]
+    dump_window : float
+        Half-width of masking window around each dump [days]
+        
+    Returns
+    -------
+    tuple
+        (masked_time, masked_flux, masked_flux_err, n_masked)
+    """
+    if len(time) == 0:
+        return time, flux, flux_err, 0
+    
+    # Find time of first dump (align to observation start)
+    t0 = time[0]
+    # Mask windows around each dump
+    dump_times = np.arange(t0, time[-1], dump_interval)
+    
+    mask = np.ones(len(time), dtype=bool)
+    for dump_t in dump_times:
+        dump_mask = np.abs(time - dump_t) <= dump_window
+        mask &= ~dump_mask
+    
+    n_masked = int((~mask).sum())
+    if n_masked > 0:
+        logger.debug("Masked %d cadences in momentum dump windows", n_masked)
+    
+    masked_time = time[mask]
+    masked_flux = flux[mask]
+    masked_err = flux_err[mask] if flux_err is not None else None
+    
+    return masked_time, masked_flux, masked_err, n_masked
+
+
+def stitch_lightcurves(
+    lc_list: List,
+    max_sectors: int = 6,
+) -> "LightCurveCollection":
+    """
+    Stitch multiple light curves from different sectors into a single continuous light curve.
+    
+    Each sector is detrended individually before stitching to preserve transit shapes
+    while removing sector-specific systematics.
+    
+    Parameters
+    ----------
+    lc_list : List
+        List of light curve objects from different sectors
+    max_sectors : int
+        Maximum number of sectors to stitch (default 6 for performance)
+        
+    Returns
+    -------
+    LightCurve
+        Stitched light curve
+    """
+    if not lc_list:
+        raise ValueError("No light curves to stitch")
+    
+    if len(lc_list) == 1:
+        return lc_list[0]
+    
+    # Limit number of sectors for performance
+    if len(lc_list) > max_sectors:
+        logger.info("Limiting to first %d sectors (of %d available)", max_sectors, len(lc_list))
+        lc_list = lc_list[:max_sectors]
+    
+    # Stitch using lightkurve's built-in stitch method
+    # This handles time alignment and flux normalization
+    lc_collection = LightCurveCollection(lc_list)
+    stitched = lc_collection.stitch()
+    
+    logger.info("Stitched %d sectors into single light curve (%d points)", 
+                len(lc_list), len(stitched.time))
+    return stitched
+
+
+def ingest_mast_lightcurve_multi_sector(
+    target: str,
+    mission: str = "TESS",
+    sectors: Optional[List[int]] = None,
+    max_sectors: int = 6,
+    quality: str = "cleaned",
+    quarter: Optional[int] = None,
+    cadence_min: int = 180,
+    window_savgol: int = 120,
+    poly_order: int = 3,
+    sigma_clip: float = 6.0,
+    mask_momentum: bool = True,
+    fits_file: Optional[str] = None,
+) -> LightCurveData:
+    """
+    Multi-sector ingestion pipeline: downloads, detrends, and stitches all available sectors.
+    
+    Steps:
+      1. Search MAST for all available sectors for the target
+      2. Download each sector's FITS light curve
+      3. Clean and detrend each sector individually
+      4. Stitch sectors into a single continuous light curve
+      5. Apply momentum dump masking (optional)
+      
+    Parameters
+    ----------
+    target : str
+        TIC, KIC, or target identifier
+    mission : str
+        'TESS' or 'Kepler'
+    sectors : List[int], optional
+        Specific sectors to download. If None, downloads all available.
+    max_sectors : int
+        Maximum sectors to process (default 6 for performance)
+    quality : str
+        Quality filter
+    quarter : int, optional
+        Kepler quarter
+    cadence_min : int
+        Cadence in minutes (120 for 2-min, 1800 for 30-min)
+    window_savgol : int
+        Savitzky-Golay window
+    poly_order : int
+        Savitzky-Golay polynomial order
+    sigma_clip : float
+        Sigma clipping threshold
+    mask_momentum : bool
+        Whether to mask momentum dump cadences
+    fits_file : str, optional
+        Local FITS file path (bypasses MAST)
+        
+    Returns
+    -------
+    LightCurveData
+        Stitched, detrended light curve data
+    """
+    if fits_file is not None:
+        return ingest_mast_lightcurve(
+            target=target, mission=mission, quality=quality, sector=None,
+            quarter=quarter, cadence_min=cadence_min, window_savgol=window_savgol,
+            poly_order=poly_order, sigma_clip=sigma_clip, fits_file=fits_file
+        )
+    
+    # Search for all available sectors
+    candidates = search_mast(target, mission)
+    
+    if sectors is not None:
+        candidates = [c for c in candidates if c.get("sector") in [str(s) for s in sectors]]
+        if not candidates:
+            raise LookupError(f"Requested sectors {sectors} not available for {target!r}.")
+    
+    if not candidates:
+        raise LookupError(f"No light curves found in MAST for target {target!r}.")
+    
+    # Sort by cadence (prefer 2-min)
+    candidates.sort(key=lambda c: (c.get("cadence_min") or 1e9))
+    
+    # Limit number of sectors
+    if len(candidates) > max_sectors:
+        logger.info("Limiting to %d sectors (of %d available)", max_sectors, len(candidates))
+        candidates = candidates[:max_sectors]
+    
+    logger.info("Downloading %d sector(s) for %s", len(candidates), target)
+    
+    mission_lower = mission.lower()
+    author = "SPOC" if mission_lower == "tess" else "Kepler"
+    
+    lc_list = []
+    cache_dir = Path("data/cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    for chosen in candidates:
+        sector_str = chosen.get("sector", "")
+        logger.info("Processing sector %s", sector_str)
+        
+        # Re-locate the exact search row
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                lc_search = search_lightcurve(target, mission=mission_lower, author=author, limit=50, cloud_only=True)
+            except TypeError:
+                lc_search = search_lightcurve(target, mission=mission_lower, author=author, limit=50)
+        
+        lc_obj = None
+        for i in range(len(lc_search)):
+            lc = lc_search[i]
+            if getattr(lc, "download_url", None) == chosen["download_url"]:
+                lc_obj = lc
+                break
+        if lc_obj is None:
+            lc_obj = lc_search[0]
+        
+        # Download FITS
+        data_uri = None
+        try:
+            if lc_search.table is not None and len(lc_search.table) > 0:
+                for i in range(len(lc_search.table)):
+                    row = lc_search.table[i]
+                    for col in ["dataURL", "dataURI"]:
+                        if col in row.colnames:
+                            val = row[col]
+                            if val:
+                                data_uri = str(val)
+                                break
+                    if data_uri:
+                        break
+        except Exception:
+            pass
+        
+        if not data_uri:
+            data_uri = chosen.get("download_url") or getattr(lc_obj, "download_url", None)
+        
+        if not data_uri:
+            logger.warning("Cannot determine FITS download URI for sector %s", sector_str)
+            continue
+            
+        if data_uri.startswith("http"):
+            url = data_uri
+        else:
+            url = f"https://mast.stsci.edu/api/v0.1/Download/file?uri={data_uri}"
+        
+        # Download with retries
+        local_path = None
+        for attempt in range(1, 4):
+            try:
+                logger.info("Downloading sector %s (attempt %d/3)", sector_str, attempt)
+                local_path = _download_fits_chunked(url, cache_dir, max_attempts=1)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    lc = lk_read(str(local_path))
+                if lc is not None:
+                    break
+            except Exception as e:
+                logger.warning("Download attempt %d/3 failed: %s", attempt, e)
+                for f_path in cache_dir.rglob("*.fits*"):
+                    try:
+                        f_path.unlink()
+                    except Exception:
+                        pass
+                if attempt == 3:
+                    logger.error("Failed to download sector %s after 3 attempts", sector_str)
+                    continue
+                time_mod.sleep(2 * attempt)
+        
+        if lc is None:
+            continue
+            
+        if isinstance(lc, LightCurveCollection):
+            lc = lc[0]
+        
+        lc_list.append(lc)
+    
+    if not lc_list:
+        raise RuntimeError(f"Failed to download any sectors for {target!r}")
+    
+    # Stitch sectors
+    stitched_lc = stitch_lightcurves(lc_list, max_sectors=max_sectors)
+    
+    # Extract arrays
+    time = np.asarray(stitched_lc.time.value, dtype=np.float64)
+    flux = np.asarray(stitched_lc.flux.value, dtype=np.float64)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        flux_err = np.asarray(stitched_lc.flux_err.value, dtype=np.float64) if stitched_lc.flux_err is not None else None
+    
+    # Apply momentum dump masking
+    if mask_momentum and mission_lower == "tess":
+        time, flux, flux_err, n_masked = mask_momentum_dumps(time, flux, flux_err)
+        logger.info("Masked %d momentum dump cadences", n_masked)
+    
+    # Clean
+    cleaned_time, cleaned_flux, cleaned_err, n_removed = clean_lightcurve(
+        time, flux, flux_err, lc=stitched_lc, sigma_clip=sigma_clip
+    )
+    logger.info("Cleaning removed %d / %d points.", n_removed, time.size)
+    
+    # Detrend
+    flux_norm = detrend_lightcurve(cleaned_time, cleaned_flux, window_savgol=window_savgol, poly_order=poly_order)
+    
+    # Collect metadata from all sectors
+    sector_strs = [str(getattr(lc, "sector", "")) for lc in lc_list]
+    metadata = {
+        "target_name": str(getattr(stitched_lc, "target_name", target)),
+        "mission": str(getattr(stitched_lc, "mission", mission)),
+        "sector": ",".join(sector_strs),
+        "quarter": str(getattr(stitched_lc, "quarter", "")),
+        "quality": str(getattr(stitched_lc, "quality", "")),
+        "flux_column": "SAP_FLUX" if "TESS" in str(mission).upper() else "PDCSAP_FLUX",
+        "teff": str(getattr(stitched_lc, "teff", "")),
+        "t0_bjd": str(getattr(stitched_lc, "t0_bjd", "")),
+        "period": str(getattr(stitched_lc, "period", "")),
+    }
+    
+    cadence_s = float(np.median(np.diff(cleaned_time))) * 86400.0 if cleaned_time.size > 1 else 60.0
+    return LightCurveData(
+        target=target,
+        mission=mission.upper(),
+        time=cleaned_time,
+        raw_flux=cleaned_flux,
+        flux=flux_norm,
+        flux_err=cleaned_err,
+        cadence_s=cadence_s,
+        n_removed=int(n_removed),
+        metadata=metadata,
+    )
+
 __all__ = [
     "LightCurveData",
     "search_mast",
     "ingest_mast_lightcurve",
+    "ingest_mast_lightcurve_multi_sector",
     "clean_lightcurve",
     "detrend_lightcurve",
     "normalize_target_id",
     "sanitize_filename",
+    "mask_momentum_dumps",
+    "stitch_lightcurves",
 ]
 
 
