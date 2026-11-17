@@ -123,7 +123,7 @@ class TestParseCatalog:
             f.flush()
             result = parse_catalog(Path(f.name))
         os.unlink(f.name)
-        assert result == ["25155310", "25155311", "25155312"]
+        assert result == ["TIC 25155310", "TIC 25155311", "TIC 25155312"]
     
     def test_csv_with_header(self):
         """Test parsing CSV with tic_id column."""
@@ -132,7 +132,7 @@ class TestParseCatalog:
             f.flush()
             result = parse_catalog(Path(f.name))
         os.unlink(f.name)
-        assert result == ["25155310", "25155311"]
+        assert result == ["TIC 25155310", "TIC 25155311"]
     
     def test_csv_with_tic_column(self):
         """Test parsing CSV with TIC column."""
@@ -141,7 +141,7 @@ class TestParseCatalog:
             f.flush()
             result = parse_catalog(Path(f.name))
         os.unlink(f.name)
-        assert result == ["25155310", "25155311"]
+        assert result == ["TIC 25155310", "TIC 25155311"]
     
     def test_comments_ignored(self):
         """Test that comment lines are ignored."""
@@ -150,7 +150,7 @@ class TestParseCatalog:
             f.flush()
             result = parse_catalog(Path(f.name))
         os.unlink(f.name)
-        assert result == ["25155310", "25155311"]
+        assert result == ["TIC 25155310", "TIC 25155311"]
 
 
 class TestVettingIntegration:

@@ -1,0 +1,138 @@
+[
+  {
+    "tic_id": "TIC 261136679",
+    "sector": "1",
+    "disposition": "FALSE_POSITIVE",
+    "confidence_score": 0.16954067487354493,
+    "vetting_flags": [
+      "EB_SUSPECT",
+      "INSTRUMENTAL_ARTIFACT",
+      "LOW_SPNR"
+    ],
+    "metrics": {
+      "odd_even_depth": 0.537190971954888,
+      "duration_period_consistency": 0.03965736040609134,
+      "box_shape_consistency": 0.9989860641202105,
+      "momentum_dump_proximity": 0.12499827846227163,
+      "signal_to_pink_noise": 1.5135582911816354,
+      "secondary_eclipse": 0.0,
+      "period_d": 6.304000000000006,
+      "t0_bjd": 1325.4219587735226,
+      "duration_d": 0.25,
+      "depth_ppm": -89.48613466534319,
+      "snr": 21.336940752939785
+    },
+    "check_details": [
+      {
+        "name": "odd_even_depth",
+        "passed": false,
+        "value": 0.537190971954888,
+        "threshold": 0.3,
+        "description": "Odd/even fractional depth difference: 0.537 (threshold: 0.3)"
+      },
+      {
+        "name": "duration_period_consistency",
+        "passed": true,
+        "value": 0.03965736040609134,
+        "threshold": 0.1,
+        "description": "Duration/period ratio: 0.0397 (OK)"
+      },
+      {
+        "name": "box_shape_consistency",
+        "passed": true,
+        "value": 0.9989860641202105,
+        "threshold": 0.8,
+        "description": "V-shape/box RMS ratio: 0.999 (>0.8 favors box/U-shape)"
+      },
+      {
+        "name": "momentum_dump_proximity",
+        "passed": false,
+        "value": 0.12499827846227163,
+        "threshold": 0.5,
+        "description": "Closest approach to artifact: 0.125 days (tol: 0.5)"
+      },
+      {
+        "name": "signal_to_pink_noise",
+        "passed": false,
+        "value": 1.5135582911816354,
+        "threshold": 7.0,
+        "description": "SPNR: 1.51 (beta=2.39, threshold: 7.0)"
+      },
+      {
+        "name": "secondary_eclipse",
+        "passed": true,
+        "value": 0.0,
+        "threshold": 0.5,
+        "description": "Non-positive primary depth"
+      }
+    ]
+  },
+  {
+    "tic_id": "TIC 307210830",
+    "sector": "2",
+    "disposition": "FALSE_POSITIVE",
+    "confidence_score": 0.1361024675511125,
+    "vetting_flags": [
+      "EB_SUSPECT",
+      "INSTRUMENTAL_ARTIFACT",
+      "LOW_SPNR"
+    ],
+    "metrics": {
+      "odd_even_depth": 0.6325398318128045,
+      "duration_period_consistency": 0.007853668810003541,
+      "box_shape_consistency": 0.9992524993942978,
+      "momentum_dump_proximity": 0.026901554421783658,
+      "signal_to_pink_noise": 1.6895996391077088,
+      "secondary_eclipse": 0.0,
+      "period_d": 6.842000000000006,
+      "t0_bjd": 1354.1343128954463,
+      "duration_d": 0.05373480199804428,
+      "depth_ppm": -627.6623129702197,
+      "snr": 8.677889544596459
+    },
+    "check_details": [
+      {
+        "name": "odd_even_depth",
+        "passed": false,
+        "value": 0.6325398318128045,
+        "threshold": 0.3,
+        "description": "Odd/even fractional depth difference: 0.633 (threshold: 0.3)"
+      },
+      {
+        "name": "duration_period_consistency",
+        "passed": true,
+        "value": 0.007853668810003541,
+        "threshold": 0.1,
+        "description": "Duration/period ratio: 0.0079 (OK)"
+      },
+      {
+        "name": "box_shape_consistency",
+        "passed": true,
+        "value": 0.9992524993942978,
+        "threshold": 0.8,
+        "description": "V-shape/box RMS ratio: 0.999 (>0.8 favors box/U-shape)"
+      },
+      {
+        "name": "momentum_dump_proximity",
+        "passed": false,
+        "value": 0.026901554421783658,
+        "threshold": 0.5,
+        "description": "Closest approach to artifact: 0.027 days (tol: 0.5)"
+      },
+      {
+        "name": "signal_to_pink_noise",
+        "passed": false,
+        "value": 1.6895996391077088,
+        "threshold": 7.0,
+        "description": "SPNR: 1.69 (beta=1.60, threshold: 7.0)"
+      },
+      {
+        "name": "secondary_eclipse",
+        "passed": true,
+        "value": 0.0,
+        "threshold": 0.5,
+        "description": "Non-positive primary depth"
+      }
+    ]
+  }
+]
