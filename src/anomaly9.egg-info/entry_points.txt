@@ -1,2 +1,3 @@
 [console_scripts]
+anomaly9-batch = anomaly9.cli:main
 anomaly9-detect = anomaly9.main:main
