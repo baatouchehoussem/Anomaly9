@@ -23,7 +23,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from anomaly9.pipeline import ingest_mast_lightcurve, LightCurveData
+from anomaly9.pipeline import ingest_mast_lightcurve, LightCurveData, normalize_target_id, sanitize_filename
 from anomaly9.detector import run_dual_detector, DetectionReport, BLSResult
 from anomaly9.vetting import vet_candidate, VettingReport
 
@@ -40,35 +40,50 @@ def setup_logging(verbose: bool = False):
     )
 
 
-def parse_catalog(catalog_path: Path) -> List[str]:
-    """Parse a catalog file (newline-separated or CSV with 'tic_id' column)."""
+def parse_catalog(catalog_path: Path, mission: str = "TESS") -> List[str]:
+    """Parse a catalog file (newline-separated or CSV with 'tic_id' column).
+    
+    Opens with utf-8-sig to handle UTF-8 BOM from Windows PowerShell.
+    Applies normalize_target_id to each parsed entry.
+    """
     tic_ids = []
-    with open(catalog_path, "r") as f:
-        # Try CSV first
+    # Use utf-8-sig to automatically strip BOM
+    with open(catalog_path, "r", encoding="utf-8-sig") as f:
         content = f.read().strip()
         if not content:
             return tic_ids
         
         lines = content.splitlines()
-        # Check if first line looks like a header
-        if lines and ("tic" in lines[0].lower() or "id" in lines[0].lower()):
+        # Check if first line looks like a CSV header
+        first_line = lines[0].strip().lower()
+        # Known header patterns (exact matches or with commas)
+        known_headers = {"tic_id", "target", "id", "tic", "kic"}
+        # It's a header if:
+        # 1. First line contains comma/tab (multi-column CSV)
+        # 2. First line exactly matches a known header name
+        # 3. First line starts with known header followed by comma
+        has_delimiter = "," in lines[0] or "\t" in lines[0]
+        exact_header_match = first_line in known_headers
+        starts_with_header = any(first_line.startswith(h + ",") for h in known_headers)
+        is_csv_header = has_delimiter or exact_header_match or starts_with_header
+        
+        if is_csv_header:
             # CSV with header
             import io
-            f.seek(0)
             reader = csv.DictReader(io.StringIO(content))
             for row in reader:
                 for key in row:
-                    if "tic" in key.lower() or "id" in key.lower():
+                    if "tic" in key.lower() or "id" in key.lower() or "target" in key.lower():
                         val = row[key].strip()
                         if val:
-                            tic_ids.append(val)
+                            tic_ids.append(normalize_target_id(val, mission))
                         break
         else:
             # Newline-separated
             for line in lines:
                 val = line.strip()
                 if val and not val.startswith("#"):
-                    tic_ids.append(val)
+                    tic_ids.append(normalize_target_id(val, mission))
     return tic_ids
 
 
@@ -170,7 +185,8 @@ def process_single_target(
         
         # Generate diagnostic plot
         if diagnostic_dir:
-            generate_diagnostic_plot(data, report, vetting_report, diagnostic_dir / f"{tic_id}_diagnostic.png")
+            safe_tic_id = sanitize_filename(tic_id)
+            generate_diagnostic_plot(data, report, vetting_report, diagnostic_dir / f"{safe_tic_id}_diagnostic.png")
         
         # Rate limiting
         if rate_limit_delay > 0:
@@ -467,10 +483,10 @@ def main():
     # Parse target list
     tic_ids = []
     if args.tic:
-        tic_id = args.tic.replace("TIC", "").replace("tic", "").strip()
+        tic_id = normalize_target_id(args.tic, args.mission)
         tic_ids = [tic_id]
     elif args.catalog:
-        tic_ids = parse_catalog(Path(args.catalog))
+        tic_ids = parse_catalog(Path(args.catalog), args.mission)
     
     if not tic_ids:
         logger.error("No valid TIC IDs to process")

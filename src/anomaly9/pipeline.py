@@ -49,6 +49,8 @@ __all__ = [
     "ingest_mast_lightcurve",
     "clean_lightcurve",
     "detrend_lightcurve",
+    "normalize_target_id",
+    "sanitize_filename",
 ]
 
 
@@ -452,3 +454,102 @@ def detrend_lightcurve(
         win, win * cadence_d, order,
     )
     return detrended
+
+
+def normalize_target_id(target: str, mission: str = "TESS") -> str:
+    """
+    Normalize a target identifier for MAST queries.
+    
+    Parameters
+    ----------
+    target : str
+        Target identifier (e.g., "307210830", "tic307210830", "TIC 307210830")
+    mission : str
+        Mission name ("TESS" or "Kepler")
+        
+    Returns
+    -------
+    str
+        Normalized target ID (e.g., "TIC 307210830" or "KIC 11446443")
+    """
+    if target is None:
+        return target
+    
+    # Strip Unicode BOM first, then whitespace
+    cleaned = target.lstrip("\ufeff").strip()
+    
+    mission_upper = mission.upper()
+    
+    if mission_upper == "TESS":
+        # Check if it's already in TIC format (case-insensitive)
+        if cleaned.upper().startswith("TIC"):
+            # Normalize spacing: "TIC307210830" or "tic 307210830" -> "TIC 307210830"
+            parts = cleaned.split()
+            if len(parts) == 1 and parts[0].upper().startswith("TIC"):
+                # No space after TIC
+                num_part = parts[0][3:]
+                if num_part.isdigit():
+                    return f"TIC {num_part}"
+            elif len(parts) >= 2 and parts[0].upper() == "TIC":
+                # Has space after TIC, e.g., "tic 307210830"
+                num_part = parts[1]
+                if num_part.isdigit():
+                    return f"TIC {num_part}"
+            return f"TIC {parts[-1]}" if parts[-1].isdigit() else cleaned
+        # Bare numeric ID
+        elif cleaned.isdigit():
+            return f"TIC {cleaned}"
+        # Lowercase tic prefix without space: "tic307210830"
+        elif cleaned.lower().startswith("tic"):
+            num_part = cleaned[3:].strip()
+            if num_part.isdigit():
+                return f"TIC {num_part}"
+    
+    elif mission_upper == "KEPLER":
+        # Check if it's already in KIC format (case-insensitive)
+        if cleaned.upper().startswith("KIC"):
+            parts = cleaned.split()
+            if len(parts) == 1 and parts[0].upper().startswith("KIC"):
+                num_part = parts[0][3:]
+                if num_part.isdigit():
+                    return f"KIC {num_part}"
+            elif len(parts) >= 2 and parts[0].upper() == "KIC":
+                num_part = parts[1]
+                if num_part.isdigit():
+                    return f"KIC {num_part}"
+            return f"KIC {parts[-1]}" if parts[-1].isdigit() else cleaned
+        # Bare numeric ID
+        elif cleaned.isdigit():
+            return f"KIC {cleaned}"
+        # Lowercase kic prefix without space: "kic11446443"
+        elif cleaned.lower().startswith("kic"):
+            num_part = cleaned[3:].strip()
+            if num_part.isdigit():
+                return f"KIC {num_part}"
+    
+    # Return as-is if no normalization rule applies
+    return cleaned
+
+
+def sanitize_filename(text: str) -> str:
+    """
+    Sanitize a string for use in filenames.
+    
+    Replaces spaces and special characters with underscores.
+    
+    Parameters
+    ----------
+    text : str
+        Input string
+        
+    Returns
+    -------
+    str
+        Sanitized string safe for filenames
+    """
+    # Replace spaces with underscores
+    sanitized = text.replace(" ", "_")
+    # Remove any characters that aren't ASCII alphanumeric, underscore, hyphen, or dot
+    import re
+    sanitized = re.sub(r'[^A-Za-z0-9_\-\.]', '', sanitized)
+    return sanitized
