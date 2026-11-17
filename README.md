@@ -1,0 +1,35 @@
+# Anomaly9: Phase 1 Core NASA MAST Data Ingestion, Detrending & Dual Detection Engine
+
+Anomaly9 is a production-grade Python exoplanet and astrophysical anomaly hunting engine designed to query NASA's Mikulski Archive for Space Telescopes (MAST), ingest TESS and Kepler FITS light curve data, perform robust noise removal (Savitzky-Golay detrending), and execute a dual-core detection engine:
+1. **Box Least Squares (BLS)** periodogram for periodic exoplanet transit search.
+2. **Unsupervised Anomaly Detection (Isolation Forest & Z-score sliding window)** for non-periodic, single-transit dips, flares, and instrumental anomalies.
+
+## Project Structure
+```text
+anomaly9/
+├── requirements.txt
+├── README.md
+└── src/
+    └── anomaly9/
+        ├── __init__.py
+        ├── pipeline.py      # NASA MAST query, FITS download, NaN cleaning, Savitzky-Golay detrending
+        ├── detector.py      # Dual-core detector: BLS transit periodogram + IsolationForest anomaly scorer
+        └── main.py          # CLI entry point, physical metrics printer, 3-panel PNG diagnostic plotter
+```
+
+## Installation
+```bash
+pip install -r requirements.txt
+pip install -e .
+```
+
+## Usage
+Run analysis on a TESS or Kepler target:
+```bash
+anomaly9-detect --target "TIC 25155310" --mission TESS --output anomaly9_diagnostic.png
+```
+Or via Python:
+```python
+from anomaly9.pipeline import ingest_mast_lightcurve
+from anomaly9.detector import run_dual_detector
+```

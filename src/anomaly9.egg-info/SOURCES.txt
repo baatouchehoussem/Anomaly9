@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+src/anomaly9/__init__.py
+src/anomaly9/detector.py
+src/anomaly9/main.py
+src/anomaly9/pipeline.py
+src/anomaly9.egg-info/PKG-INFO
+src/anomaly9.egg-info/SOURCES.txt
+src/anomaly9.egg-info/dependency_links.txt
+src/anomaly9.egg-info/entry_points.txt
+src/anomaly9.egg-info/requires.txt
+src/anomaly9.egg-info/top_level.txt
+tests/test_anomaly9.py
