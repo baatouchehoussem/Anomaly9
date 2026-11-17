@@ -23,7 +23,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from anomaly9.pipeline import ingest_mast_lightcurve, LightCurveData, normalize_target_id, sanitize_filename
+from anomaly9.pipeline import ingest_mast_lightcurve, ingest_mast_lightcurve_multi_sector, LightCurveData, normalize_target_id, sanitize_filename
 from anomaly9.detector import run_dual_detector, DetectionReport, BLSResult
 from anomaly9.vetting import vet_candidate, VettingReport
 
@@ -109,32 +109,47 @@ def process_single_target(
     try:
         logger.info("Processing %s (mission=%s)", tic_id, mission)
         
-        # Try each sector if specified, otherwise let pipeline choose
-        data: Optional[LightCurveData] = None
-        last_error = None
-        
-        sector_list = sectors if sectors else [None]
-        
-        for sector in sector_list:
+        # Use multi-sector ingestion if no specific sectors requested
+        if sectors is None:
             try:
-                data = ingest_mast_lightcurve(
+                data = ingest_mast_lightcurve_multi_sector(
                     target=tic_id,
                     mission=mission,
-                    sector=sector,
+                    sectors=None,
+                    max_sectors=6,
                     window_savgol=120,
                     poly_order=3,
                     sigma_clip=6.0,
+                    mask_momentum=True,
                 )
-                if data.n_points > 30:
-                    break
             except Exception as e:
-                last_error = e
-                logger.warning("Failed to ingest %s sector %s: %s", tic_id, sector, e)
-                continue
-        
-        if data is None or data.n_points < 30:
-            logger.error("No valid light curve for %s: %s", tic_id, last_error)
-            return None
+                logger.error("Multi-sector ingestion failed for %s: %s", tic_id, e)
+                return None
+        else:
+            # Try each sector if specified
+            data: Optional[LightCurveData] = None
+            last_error = None
+            
+            for sector in sectors:
+                try:
+                    data = ingest_mast_lightcurve(
+                        target=tic_id,
+                        mission=mission,
+                        sector=sector,
+                        window_savgol=120,
+                        poly_order=3,
+                        sigma_clip=6.0,
+                    )
+                    if data.n_points > 30:
+                        break
+                except Exception as e:
+                    last_error = e
+                    logger.warning("Failed to ingest %s sector %s: %s", tic_id, sector, e)
+                    continue
+            
+            if data is None or data.n_points < 30:
+                logger.error("No valid light curve for %s: %s", tic_id, last_error)
+                return None
         
         # Run dual detector
         report = run_dual_detector(
@@ -186,7 +201,12 @@ def process_single_target(
         # Generate diagnostic plot
         if diagnostic_dir:
             safe_tic_id = sanitize_filename(tic_id)
-            generate_diagnostic_plot(data, report, vetting_report, diagnostic_dir / f"{safe_tic_id}_diagnostic.png")
+            try:
+                generate_diagnostic_plot(data, report, vetting_report, diagnostic_dir / f"{safe_tic_id}_diagnostic.png")
+            except MemoryError:
+                logger.warning("MemoryError generating diagnostic plot for %s, skipping", tic_id)
+            except Exception as e:
+                logger.warning("Failed to generate diagnostic plot for %s: %s", tic_id, e)
         
         # Rate limiting
         if rate_limit_delay > 0:

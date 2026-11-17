@@ -271,12 +271,12 @@ class TestVettingIntegration:
 
 
 class TestBatchPipeline:
-    @patch("anomaly9.cli.ingest_mast_lightcurve")
-    def test_process_single_target_success(self, mock_ingest):
+    @patch("anomaly9.cli.ingest_mast_lightcurve_multi_sector")
+    def test_process_single_target_success(self, mock_ingest_multi):
         """Test process_single_target with mocked MAST ingestion."""
         # Create mock light curve
         lc = make_synthetic_lcdata()
-        mock_ingest.return_value = lc
+        mock_ingest_multi.return_value = lc
         
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir) / "output"
@@ -304,10 +304,10 @@ class TestBatchPipeline:
             assert report.tic_id == "25155310"
             assert report.disposition in ["CANDIDATE", "AMBIGUOUS", "FALSE_POSITIVE"]
     
-    @patch("anomaly9.cli.ingest_mast_lightcurve")
-    def test_process_single_target_failure(self, mock_ingest):
+    @patch("anomaly9.cli.ingest_mast_lightcurve_multi_sector")
+    def test_process_single_target_failure(self, mock_ingest_multi):
         """Test process_single_target handles ingestion failure."""
-        mock_ingest.side_effect = Exception("MAST query failed")
+        mock_ingest_multi.side_effect = Exception("MAST query failed")
         
         with tempfile.TemporaryDirectory() as tmpdir:
             report = process_single_target(
@@ -419,11 +419,11 @@ class TestCLIArguments:
 
 
 class TestEndToEndBatch:
-    @patch("anomaly9.cli.ingest_mast_lightcurve")
-    def test_batch_multiple_targets(self, mock_ingest):
+    @patch("anomaly9.cli.ingest_mast_lightcurve_multi_sector")
+    def test_batch_multiple_targets(self, mock_ingest_multi):
         """Test batch processing multiple targets."""
         # Create different light curves for different targets
-        def side_effect(target, mission, sector, **kwargs):
+        def side_effect(target, mission, sectors, **kwargs):
             if target == "25155310":
                 return make_synthetic_lcdata(tic_id=target)
             elif target == "25155311":
@@ -432,7 +432,7 @@ class TestEndToEndBatch:
                 return make_instrumental_lcdata(tic_id=target)
             raise ValueError(f"Unknown target {target}")
         
-        mock_ingest.side_effect = side_effect
+        mock_ingest_multi.side_effect = side_effect
         
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir) / "output"
