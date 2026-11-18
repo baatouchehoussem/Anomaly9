@@ -8,7 +8,7 @@ import pytest
 from anomaly9.vetting.checks import (
     odd_even_depth_test,
     duration_period_consistency,
-    box_shape_consistency,
+    transit_shape_boxiness,
     momentum_dump_proximity,
     signal_to_pink_noise_ratio,
     secondary_eclipse_check,
@@ -146,20 +146,20 @@ class TestDurationPeriodConsistency:
         assert result.passed == False
 
 
-class TestBoxShapeConsistency:
-    def test_box_shaped_passes(self):
-        """Box-shaped (U-shaped) transit should pass."""
+class TestTransitShapeBoxiness:
+    def test_u_shaped_passes(self):
+        """U-shaped (planetary) transit should pass."""
         np.random.seed(42)
         time, flux = make_clean_transit_data(duration=0.1, depth_frac=0.001, noise=1e-6)
-        result = box_shape_consistency(time, flux, period=2.0, t0=2458001.0, duration=0.1)
+        result = transit_shape_boxiness(time, flux, period=2.0, t0=2458001.0, duration=0.1)
         assert result.passed == True
-        assert result.value > 0.8
+        assert result.value >= 0.7
     
     def test_v_shaped_runs(self):
         """V-shaped (grazing) transit should run."""
         np.random.seed(42)
         time, flux = make_grazing_eb_data()
-        result = box_shape_consistency(time, flux, period=2.0, t0=2458001.0, duration=0.02)
+        result = transit_shape_boxiness(time, flux, period=2.0, t0=2458001.0, duration=0.02)
         assert isinstance(result, VettingCheckResult)
 
 

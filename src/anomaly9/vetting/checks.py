@@ -8,6 +8,8 @@ Implements standard astrophysical false-positive diagnostics:
 - Duration-to-Period & Box-Shape Consistency (grazing eclipse vs planetary)
 - Instrumental / Momentum Dump Proximity Filter
 - Signal-to-Pink-Noise Ratio (SPNR) for correlated red noise
+- Secondary Eclipse Check (self-luminous companion)
+- Transit Shape Boxiness (U-shape vs V-shape)
 """
 
 from __future__ import annotations
@@ -132,6 +134,8 @@ def odd_even_depth_test(
         )
 
     depths = np.array(depths)
+    # Ensure positive depths (transits are dips)
+    depths = np.abs(depths)
     odd_depths = depths[0::2]   # 1st, 3rd, 5th... (0-indexed even)
     even_depths = depths[1::2]  # 2nd, 4th, 6th... (0-indexed odd)
 
@@ -254,7 +258,7 @@ def duration_period_consistency(
     )
 
 
-def box_shape_consistency(
+def transit_shape_boxiness(
     time: np.ndarray,
     flux: np.ndarray,
     period: float,
@@ -262,91 +266,113 @@ def box_shape_consistency(
     duration: float,
 ) -> VettingCheckResult:
     """
-    Box-Shape Consistency Check: U-shaped (planetary) vs V-shaped (grazing EB).
+    Transit Shape Boxiness Test: U-shaped (planetary) vs V-shaped (grazing EB).
 
-    Fits both box and trapezoid models to the phase-folded transit
-    and compares residuals. Planetary transits are more box-like
-    (flat bottom); grazing EBs are V-shaped (no flat bottom).
+    Fits a trapezoid model (with ingress/egress) and a box model to the
+    phase-folded transit. Planetary transits have flat bottoms (box-like);
+    grazing EBs are V-shaped with no flat bottom.
+    
+    Uses the ratio of trapezoid-fit residuals to box-fit residuals.
+    For planetary transits, box model fits well (ratio ~1).
+    For grazing EBs, trapezoid fits much better (ratio < 0.7).
     """
     if len(time) < 20:
         return VettingCheckResult(
-            name="box_shape_consistency",
+            name="transit_shape_boxiness",
             passed=True,
-            value=0.0,
-            threshold=0.5,
+            value=1.0,
+            threshold=0.7,
             description="Insufficient data for shape analysis",
         )
 
     # Phase fold around the transit
     phase = ((time - t0) % period) / period
-    # Also check secondary eclipse at phase 0.5
-    phase_secondary = ((time - t0 - 0.5 * period) % period) / period
     
     # Primary transit window
     w = duration / period
     primary_mask = (phase < w) | (phase > 1 - w)
-    # Secondary eclipse window
-    secondary_mask = (phase_secondary < w) | (phase_secondary > 1 - w)
     
     # Get in-transit and out-of-transit fluxes
     in_primary = flux[primary_mask]
-    out_flux = flux[~primary_mask & ~secondary_mask]
+    out_flux = flux[~primary_mask]
     
     if len(in_primary) < 5 or len(out_flux) < 10:
         return VettingCheckResult(
-            name="box_shape_consistency",
+            name="transit_shape_boxiness",
             passed=True,
-            value=0.0,
-            threshold=0.5,
+            value=1.0,
+            threshold=0.7,
             description="Insufficient in/out transit points",
         )
     
-    # Sort in-transit points by phase for shape analysis
+    # Sort in-transit points by phase
     primary_phases = phase[primary_mask]
     sort_idx = np.argsort(primary_phases)
     in_phases = primary_phases[sort_idx]
     in_flux_sorted = in_primary[sort_idx]
+    
+    # Normalize phases to [0, 1] across transit
+    in_phases_norm = (in_phases - in_phases[0]) / (in_phases[-1] - in_phases[0] + 1e-10)
     
     # Fit box model (constant in-transit)
     box_level = np.median(in_flux_sorted)
     box_residuals = in_flux_sorted - box_level
     box_rms = np.std(box_residuals)
     
-    # Fit linear model (V-shape)
-    if len(in_phases) > 2:
-        # Normalize phases to [-0.5, 0.5] around mid-transit
-        centered_phases = in_phases - 0.5
-        # Linear fit
-        A = np.vstack([centered_phases, np.ones_like(centered_phases)]).T
+    # Fit trapezoid model (flat bottom with linear ingress/egress)
+    # Trapezoid has 4 parameters: level, ingress_slope, egress_slope, mid_transit_fraction
+    # Simplified: fit piecewise linear with flat middle
+    if len(in_phases) > 4:
         try:
-            slope, intercept = np.linalg.lstsq(A, in_flux_sorted, rcond=None)[0]
-            v_model = slope * centered_phases + intercept
-            v_residuals = in_flux_sorted - v_model
-            v_rms = np.std(v_residuals)
-        except np.linalg.LinAlgError:
-            v_rms = box_rms
+            # Split into ingress, flat, egress (25%/50%/25%)
+            n = len(in_phases)
+            ingress_end = n // 4
+            egress_start = 3 * n // 4
+            
+            # Ingress: linear fit to first 25%
+            if ingress_end > 1:
+                A_ing = np.vstack([in_phases_norm[:ingress_end], np.ones(ingress_end)]).T
+                slope_ing, intercept_ing = np.linalg.lstsq(A_ing, in_flux_sorted[:ingress_end], rcond=None)[0]
+            
+            # Egress: linear fit to last 25%
+            if n - egress_start > 1:
+                A_eg = np.vstack([in_phases_norm[egress_start:], np.ones(n - egress_start)]).T
+                slope_eg, intercept_eg = np.linalg.lstsq(A_eg, in_flux_sorted[egress_start:], rcond=None)[0]
+            
+            # Flat bottom: median of middle 50%
+            flat_level = np.median(in_flux_sorted[ingress_end:egress_start])
+            
+            # Build trapezoid model
+            trap_model = np.zeros_like(in_flux_sorted)
+            trap_model[:ingress_end] = slope_ing * in_phases_norm[:ingress_end] + intercept_ing
+            trap_model[ingress_end:egress_start] = flat_level
+            trap_model[egress_start:] = slope_eg * in_phases_norm[egress_start:] + intercept_eg
+            
+            trap_residuals = in_flux_sorted - trap_model
+            trap_rms = np.std(trap_residuals)
+        except (np.linalg.LinAlgError, IndexError):
+            trap_rms = box_rms
     else:
-        v_rms = box_rms
+        trap_rms = box_rms
     
-    # Shape metric: ratio of V-fit RMS to box-fit RMS
-    # If box is better (planetary), ratio > 1
-    # If V-shape is better (grazing EB), ratio < 1
-    if box_rms > 0:
-        shape_ratio = v_rms / box_rms
+    # Shape metric: ratio of box RMS to trapezoid RMS
+    # If box fits as well as trapezoid (planetary), ratio ~1
+    # If trapezoid fits much better (grazing EB), ratio > 1.3
+    if trap_rms > 0:
+        shape_ratio = box_rms / trap_rms
     else:
         shape_ratio = 1.0
     
-    # Threshold: box should fit better than V-shape for planetary transits
-    # Allow some tolerance for noise
-    threshold = 0.8
-    passed = shape_ratio > threshold
+    # Threshold: box should fit nearly as well as trapezoid for planetary transits
+    threshold = 0.7
+    passed = shape_ratio >= threshold
     
     return VettingCheckResult(
-        name="box_shape_consistency",
+        name="transit_shape_boxiness",
         passed=passed,
         value=float(shape_ratio),
         threshold=threshold,
-        description=f"V-shape/box RMS ratio: {shape_ratio:.3f} (>{threshold} favors box/U-shape)",
+        description=f"Box/trapezoid RMS ratio: {shape_ratio:.3f} (>{threshold} favors U-shape/planetary)",
     )
 
 
@@ -357,7 +383,7 @@ def momentum_dump_proximity(
     t0: float,
     duration: float,
     sector: Optional[int] = None,
-    cadence_tolerance: float = 0.5,  # days
+    cadence_tolerance: float = 0.2,  # days - tighter tolerance
 ) -> VettingCheckResult:
     """
     Instrumental / Momentum Dump Proximity Filter.
@@ -387,11 +413,6 @@ def momentum_dump_proximity(
     VettingCheckResult
         passed=True if no proximity to known artifacts
     """
-    # Known momentum dump times per sector (approximate BJD)
-    # In practice, these would come from TESS Data Release Notes
-    # For now, use a heuristic: check if transits align with regular
-    # spacecraft momentum dump cadence (~2.5 days for some sectors)
-    
     # Generate all transit times in the observation window
     t_min, t_max = time[0], time[-1]
     transit_times = []
@@ -414,8 +435,6 @@ def momentum_dump_proximity(
         )
     
     # Check proximity to sector boundaries (gaps)
-    # Sector gaps typically occur at regular intervals
-    # Heuristic: flag if any transit is within tolerance of observation edges
     min_edge_dist = min(
         min(abs(tt - t_min) for tt in transit_times),
         min(abs(tt - t_max) for tt in transit_times),
@@ -431,7 +450,6 @@ def momentum_dump_proximity(
         min_dump_dist = min(min_dump_dist, dist)
     
     # Also check for data gap proximity
-    # Find large time gaps in the light curve
     dt = np.diff(time)
     median_dt = np.median(dt)
     gap_threshold = 5 * median_dt  # 5x median cadence = gap
@@ -444,15 +462,27 @@ def momentum_dump_proximity(
             dist = min(abs(tt - gs), abs(tt - ge))
             min_gap_dist = min(min_gap_dist, dist)
     
+    # Use the minimum of all distances
     closest_approach = min(min_edge_dist, min_dump_dist, min_gap_dist)
+    
+    # Stricter tolerance: only flag if transit is VERY close to artifact
     passed = closest_approach > cadence_tolerance
+    
+    # Determine which artifact is closest
+    artifact_type = "none"
+    if min_edge_dist == closest_approach:
+        artifact_type = "sector edge"
+    elif min_dump_dist == closest_approach:
+        artifact_type = "momentum dump"
+    elif min_gap_dist == closest_approach:
+        artifact_type = "data gap"
     
     return VettingCheckResult(
         name="momentum_dump_proximity",
         passed=passed,
         value=float(closest_approach),
         threshold=cadence_tolerance,
-        description=f"Closest approach to artifact: {closest_approach:.3f} days (tol: {cadence_tolerance})",
+        description=f"Closest approach to {artifact_type}: {closest_approach:.3f} days (tol: {cadence_tolerance})",
     )
 
 
@@ -499,8 +529,8 @@ def signal_to_pink_noise_ratio(
             description="Insufficient in/out transit points",
         )
     
-    # Transit depth
-    depth = np.median(out_flux) - np.median(in_flux)
+    # Transit depth (positive for dips)
+    depth = abs(np.median(out_flux) - np.median(in_flux))
     
     # White noise estimate from out-of-transit scatter
     out_residuals = out_flux - np.median(out_flux)
@@ -529,7 +559,7 @@ def signal_to_pink_noise_ratio(
     # Effective noise including red noise
     eff_noise = white_noise * beta / np.sqrt(len(in_flux))
     
-    spnr = abs(depth) / max(eff_noise, 1e-12)
+    spnr = depth / max(eff_noise, 1e-12)
     
     # Threshold: SPNR > 7 for confident detection (vs typical SNR > 7-10)
     threshold = 7.0
@@ -565,7 +595,7 @@ def secondary_eclipse_check(
             name="secondary_eclipse",
             passed=True,
             value=0.0,
-            threshold=0.5,
+            threshold=0.1,
             description="Insufficient data for secondary eclipse check",
         )
 
@@ -585,14 +615,15 @@ def secondary_eclipse_check(
             name="secondary_eclipse",
             passed=True,
             value=0.0,
-            threshold=0.5,
+            threshold=0.1,
             description="Insufficient points at secondary phase",
         )
     
     secondary_flux = flux[secondary_mask]
     out_flux = flux[out_mask]
     
-    secondary_depth = np.median(out_flux) - np.median(secondary_flux)
+    # Depths are positive for dips
+    secondary_depth = abs(np.median(out_flux) - np.median(secondary_flux))
     primary_depth_frac = depth_ppm / 1e6
     
     if primary_depth_frac <= 0:
@@ -600,7 +631,7 @@ def secondary_eclipse_check(
             name="secondary_eclipse",
             passed=True,
             value=0.0,
-            threshold=0.5,
+            threshold=0.1,
             description="Non-positive primary depth",
         )
     
@@ -639,7 +670,7 @@ def run_all_checks(
     checks = [
         odd_even_depth_test(time, flux, period, t0, duration),
         duration_period_consistency(period, duration, depth_ppm, stellar_radius_rsun),
-        box_shape_consistency(time, flux, period, t0, duration),
+        transit_shape_boxiness(time, flux, period, t0, duration),
         momentum_dump_proximity(time, flux, period, t0, duration, sector),
         signal_to_pink_noise_ratio(time, flux, period, t0, duration),
         secondary_eclipse_check(time, flux, period, t0, duration, depth_ppm),

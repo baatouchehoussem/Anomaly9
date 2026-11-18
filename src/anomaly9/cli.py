@@ -225,8 +225,8 @@ def generate_diagnostic_plot(
     vet_report: VettingReport,
     output_path: Path,
 ):
-    """Generate a 4-panel diagnostic plot including vetting results."""
-    fig, axes = plt.subplots(4, 1, figsize=(14, 14), sharex=False, constrained_layout=True)
+    """Generate a 5-panel diagnostic plot including vetting results and phase-folded transit."""
+    fig, axes = plt.subplots(5, 1, figsize=(14, 16), sharex=False, constrained_layout=True)
     
     t = data.time
     f_raw = data.raw_flux
@@ -325,6 +325,58 @@ def generate_diagnostic_plot(
             plt.Line2D([0], [0], color="red", ls="--", lw=1.5, label="Threshold"),
         ]
         ax4.legend(handles=legend_elements, loc="lower right", frameon=True, facecolor="white", framealpha=0.9)
+    
+    # Panel 5: Phase-Folded Transit Light Curve
+    ax5 = axes[4]
+    if det_report.bls_best is not None:
+        b = det_report.bls_best
+        phase = ((data.time - b.t0_bjd) % b.period_d) / b.period_d
+        # Center phase on 0.0 (transit center)
+        phase = (phase + 0.5) % 1.0 - 0.5
+        
+        # Sort by phase
+        sort_idx = np.argsort(phase)
+        phase_sorted = phase[sort_idx]
+        flux_sorted = data.flux[sort_idx]
+        
+        # Plot detrended flux
+        ax5.scatter(phase_sorted, flux_sorted, s=5, c="#555555", alpha=0.5, label="Detrended Flux")
+        
+        # Overplot binned version for clarity
+        if len(phase_sorted) > 50:
+            n_bins = min(100, len(phase_sorted) // 10)
+            bin_edges = np.linspace(-0.5, 0.5, n_bins + 1)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+            bin_means = np.zeros(n_bins)
+            bin_stds = np.zeros(n_bins)
+            for i in range(n_bins):
+                mask = (phase_sorted >= bin_edges[i]) & (phase_sorted < bin_edges[i+1])
+                if mask.sum() > 0:
+                    bin_means[i] = np.median(flux_sorted[mask])
+                    bin_stds[i] = np.std(flux_sorted[mask])
+                else:
+                    bin_means[i] = np.nan
+                    bin_stds[i] = np.nan
+            ax5.errorbar(bin_centers, bin_means, yerr=bin_stds, fmt='o', c="#1b9e77", 
+                        markersize=3, capsize=2, label="Binned", zorder=5)
+        
+        # Overplot BLS best-fit model
+        in_transit_model = np.abs(bin_centers) < (b.duration_d / b.period_d / 2)
+        model_flux = np.ones_like(bin_centers)
+        model_flux[in_transit_model] -= (b.depth_ppm / 1e6)
+        ax5.plot(bin_centers, model_flux, c="#c44e52", lw=2, label=f"BLS Model (P={b.period_d:.4f}d)", zorder=6)
+        
+        ax5.axvline(0, c="#d95f02", ls=":", lw=1.2, label="Transit Center")
+        ax5.set_xlim(-0.15, 0.15)  # Focus on transit region
+        ax5.set_xlabel("Phase (days from transit center)", fontsize=11, fontweight="bold")
+        ax5.set_ylabel("Normalized Flux", fontsize=11, fontweight="bold")
+        ax5.set_title(f"Phase-Folded Transit: {data.target} (P={b.period_d:.4f}d)", fontsize=12, fontweight="bold")
+        ax5.legend(loc="upper right", frameon=True, facecolor="white", framealpha=0.9)
+        ax5.grid(True, ls="--", alpha=0.5)
+    else:
+        ax5.text(0.5, 0.5, "No BLS detection available", ha='center', va='center', 
+                transform=ax5.transAxes, fontsize=14, color='gray')
+        ax5.set_title("Phase-Folded Transit: No BLS Detection", fontsize=12, fontweight="bold")
     
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
