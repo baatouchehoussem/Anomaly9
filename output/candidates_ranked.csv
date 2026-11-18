@@ -1,3 +1,0 @@
-rank,tic_id,sector,disposition,confidence_score,period_d,t0_bjd,duration_d,depth_ppm,snr,vetting_flags,box_shape_consistency,duration_period_consistency,momentum_dump_proximity,odd_even_depth,secondary_eclipse,signal_to_pink_noise
-1,TIC 261136679,"1,1,1,1,1,1",AMBIGUOUS,0.5011,6.292000,1325.438456,0.179831,179.728138,86.826810,INSTRUMENTAL_ARTIFACT,0.986521,0.028581,0.090108,0.000000,-0.086700,17.097216
-2,TIC 307210830,"2,2,2,2,2,2",FALSE_POSITIVE,0.3831,1.860000,1354.248982,0.179831,166.249411,19.768560,INSTRUMENTAL_ARTIFACT;LOW_SPNR,0.999990,0.096683,0.011901,0.000000,-0.058017,2.245248
