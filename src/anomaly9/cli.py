@@ -23,9 +23,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from anomaly9.pipeline import ingest_mast_lightcurve, ingest_mast_lightcurve_multi_sector, LightCurveData, normalize_target_id, sanitize_filename
+from anomaly9.pipeline import ingest_mast_lightcurve, ingest_mast_lightcurve_multi_sector, LightCurveData, normalize_target_id, sanitize_filename, run_batch_pipeline
 from anomaly9.detector import run_dual_detector, DetectionReport, BLSResult
 from anomaly9.vetting import vet_candidate, VettingReport
+from anomaly9.catalog import is_known_fp, get_stellar_density, get_stellar_radius
+from anomaly9.config import load_config, generate_default_toml, Anomaly9Config
+from anomaly9.storage import CandidateDB
 
 logger = logging.getLogger("anomaly9.cli")
 
@@ -101,6 +104,10 @@ def process_single_target(
     diagnostic_dir: Path,
     cache_dir: Path,
     rate_limit_delay: float = 1.0,
+    enable_gaia: bool = True,
+    enable_tic: bool = True,
+    enable_exofop: bool = True,
+    skip_known_fp: bool = False,
 ) -> Optional[VettingReport]:
     """
     Process a single target through the full pipeline.
@@ -121,6 +128,9 @@ def process_single_target(
                     poly_order=3,
                     sigma_clip=6.0,
                     mask_momentum=True,
+                    enable_gaia=enable_gaia,
+                    enable_tic=enable_tic,
+                    enable_exofop=enable_exofop,
                 )
             except Exception as e:
                 logger.error("Multi-sector ingestion failed for %s: %s", tic_id, e)
@@ -139,6 +149,9 @@ def process_single_target(
                         window_savgol=120,
                         poly_order=3,
                         sigma_clip=6.0,
+                        enable_gaia=enable_gaia,
+                        enable_tic=enable_tic,
+                        enable_exofop=enable_exofop,
                     )
                     if data.n_points > 30:
                         break
@@ -150,6 +163,11 @@ def process_single_target(
             if data is None or data.n_points < 30:
                 logger.error("No valid light curve for %s: %s", tic_id, last_error)
                 return None
+        
+        # Check if target is a known false positive and skip if requested
+        if skip_known_fp and is_known_fp(data):
+            logger.info("Skipping %s: known false positive per ExoFOP", tic_id)
+            return None
         
         # Run dual detector
         report = run_dual_detector(
@@ -185,6 +203,9 @@ def process_single_target(
         bls = report.bls_best
         sector_str = str(data.metadata.get("sector", "unknown"))
         
+        # Get stellar density from catalog enrichment
+        stellar_density = get_stellar_density(data)
+        
         vetting_report = vet_candidate(
             tic_id=tic_id,
             sector=sector_str,
@@ -195,7 +216,8 @@ def process_single_target(
             duration=bls.duration_d,
             depth_ppm=bls.depth_ppm,
             snr=bls.snr,
-            stellar_radius_rsun=None,
+            stellar_radius_rsun=get_stellar_radius(data),
+            stellar_density_gcc=stellar_density,
         )
         
         # Generate diagnostic plot
@@ -434,6 +456,22 @@ def write_outputs(reports: List[VettingReport], output_dir: Path):
 
 
 def main():
+    # Check for --init-config early to avoid required argument conflicts
+    if "--init-config" in sys.argv:
+        parser = argparse.ArgumentParser(
+            description="Anomaly9 Phase 2: Multi-Target Batch Pipeline with Astrophysical Vetting",
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            add_help=False,
+        )
+        parser.add_argument("--config", type=str, default=None)
+        parser.add_argument("--init-config", action="store_true")
+        args, _ = parser.parse_known_args()
+        
+        config_path = Path(args.config) if args.config else Path("anomaly9.toml")
+        generate_default_toml(config_path)
+        print(f"Generated default config at {config_path}")
+        sys.exit(0)
+    
     parser = argparse.ArgumentParser(
         description="Anomaly9 Phase 2: Multi-Target Batch Pipeline with Astrophysical Vetting",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -544,8 +582,88 @@ def main():
         help="Enable verbose logging",
     )
     
+    # Catalog matching
+    parser.add_argument(
+        "--catalog-match",
+        type=str,
+        default="gaia,tic,exofop",
+        help="Comma-separated catalogs to query: gaia,tic,exofop or 'none'",
+    )
+    parser.add_argument(
+        "--skip-known-fp",
+        action="store_true",
+        help="Skip targets flagged as false positives in ExoFOP-TESS",
+    )
+    
+    # Configuration & Database
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to TOML config file (default: anomaly9.toml or config/anomaly9.toml)",
+    )
+    parser.add_argument(
+        "--init-config",
+        action="store_true",
+        help="Generate default anomaly9.toml and exit",
+    )
+    parser.add_argument(
+        "--db",
+        type=str,
+        default="sqlite:///candidates.db",
+        help="SQLite database URL (default: sqlite:///candidates.db)",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip TICs already stored in database",
+    )
+    
     args = parser.parse_args()
+    
     setup_logging(args.verbose)
+    
+    # Load configuration
+    cli_overrides = {}
+    if args.period_min != 0.5:
+        cli_overrides["detector.period_min"] = args.period_min
+    if args.period_max != 10.0:
+        cli_overrides["detector.period_max"] = args.period_max
+    if args.period_step != 0.002:
+        cli_overrides["detector.period_step"] = args.period_step
+    if args.contamination != 0.01:
+        cli_overrides["detector.contamination"] = args.contamination
+    if args.z_window != 25:
+        cli_overrides["detector.z_window"] = args.z_window
+    if args.bls_top_n != 5:
+        cli_overrides["detector.bls_top_n"] = args.bls_top_n
+    if args.rate_limit != 1.0:
+        cli_overrides["mast.rate_limit"] = args.rate_limit
+    
+    # Parse catalog match for CLI overrides
+    catalog_match = args.catalog_match.lower().strip()
+    if catalog_match == "none":
+        cli_overrides["catalog.enable_gaia"] = False
+        cli_overrides["catalog.enable_tic"] = False
+        cli_overrides["catalog.enable_exofop"] = False
+    else:
+        catalogs = [c.strip() for c in catalog_match.split(",")]
+        cli_overrides["catalog.enable_gaia"] = "gaia" in catalogs
+        cli_overrides["catalog.enable_tic"] = "tic" in catalogs
+        cli_overrides["catalog.enable_exofop"] = "exofop" in catalogs
+    
+    config = load_config(args.config, cli_overrides)
+    
+    # Initialize database
+    db = CandidateDB(
+        url=args.db,
+        wal_mode=config.database.wal_mode,
+        busy_timeout=config.database.busy_timeout,
+    )
+    
+    # Create run entry
+    import uuid
+    run_id = str(uuid.uuid4())[:8]
     
     # Parse sectors
     sectors = None
@@ -565,71 +683,32 @@ def main():
         sys.exit(1)
     
     logger.info("Processing %d target(s) with %d worker(s)", len(tic_ids), args.workers)
+    logger.info("Config hash: %s, DB: %s", config.config_hash, args.db)
     
-    # Prepare directories
-    output_dir = Path(args.output_dir)
-    diagnostics_dir = Path(args.diagnostics_dir)
-    cache_dir = Path(args.cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Prepare output directories
+    output_dir = Path(config.output.output_dir)
+    diagnostics_dir = Path(config.output.diagnostics_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
     
-    # Process targets
-    reports: List[VettingReport] = []
+    # Run batch pipeline with config and database
+    reports = run_batch_pipeline(
+        tic_ids=tic_ids,
+        config=config,
+        db=db,
+        run_id=run_id,
+        skip_existing=args.skip_existing,
+        max_workers=args.workers,
+        rate_limit=config.mast.rate_limit,
+        output_dir=output_dir,
+        diagnostics_dir=diagnostics_dir,
+    )
     
-    if args.workers == 1:
-        # Sequential processing
-        for tic_id in tic_ids:
-            report = process_single_target(
-                tic_id=tic_id,
-                mission=args.mission,
-                sectors=sectors,
-                period_min=args.period_min,
-                period_max=args.period_max,
-                period_step=args.period_step,
-                contamination=args.contamination,
-                z_window=args.z_window,
-                bls_top_n=args.bls_top_n,
-                output_dir=output_dir,
-                diagnostic_dir=diagnostics_dir,
-                cache_dir=cache_dir,
-                rate_limit_delay=args.rate_limit,
-            )
-            if report:
-                reports.append(report)
-    else:
-        # Parallel processing
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            futures = {
-                executor.submit(
-                    process_single_target,
-                    tic_id=tic_id,
-                    mission=args.mission,
-                    sectors=sectors,
-                    period_min=args.period_min,
-                    period_max=args.period_max,
-                    period_step=args.period_step,
-                    contamination=args.contamination,
-                    z_window=args.z_window,
-                    bls_top_n=args.bls_top_n,
-                    output_dir=output_dir,
-                    diagnostic_dir=diagnostics_dir,
-                    cache_dir=cache_dir,
-                    rate_limit_delay=args.rate_limit,
-                ): tic_id
-                for tic_id in tic_ids
-            }
-            
-            for future in as_completed(futures):
-                tic_id = futures[future]
-                try:
-                    report = future.result()
-                    if report:
-                        reports.append(report)
-                except Exception as e:
-                    logger.exception("Worker error for %s: %s", tic_id, e)
-    
-    # Write outputs
+    # Write outputs (backward compatible)
     if reports:
         write_outputs(reports, output_dir)
+        # Also export from database for parity
+        db.export_to_csv_json(output_dir)
         
         # Print summary
         print("\n" + "=" * 80)

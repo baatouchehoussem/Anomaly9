@@ -9,8 +9,10 @@ transit-shaped features while removing stellar & instrumental noise.
 from __future__ import annotations
 
 import logging
+from anomaly9.catalog import enrich_with_catalogs
 import time as time_mod
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -18,6 +20,17 @@ from typing import List, Optional
 import numpy as np
 import requests
 import astroquery.mast
+
+# Optional imports for config and storage
+try:
+    from anomaly9.config import Anomaly9Config
+except ImportError:
+    Anomaly9Config = None
+
+try:
+    from anomaly9.storage import CandidateDB
+except ImportError:
+    CandidateDB = None
 
 # Configure generous timeout for NASA MAST server queries and downloads
 astroquery.mast.Conf.timeout = 300
@@ -162,6 +175,12 @@ def ingest_mast_lightcurve_multi_sector(
     sigma_clip: float = 6.0,
     mask_momentum: bool = True,
     fits_file: Optional[str] = None,
+    enable_gaia: bool = True,
+    enable_tic: bool = True,
+    enable_exofop: bool = True,
+    config: Optional[Anomaly9Config] = None,
+    db: Optional[CandidateDB] = None,
+    run_id: str = "",
 ) -> LightCurveData:
     """
     Multi-sector ingestion pipeline: downloads, detrends, and stitches all available sectors.
@@ -172,6 +191,7 @@ def ingest_mast_lightcurve_multi_sector(
       3. Clean and detrend each sector individually
       4. Stitch sectors into a single continuous light curve
       5. Apply momentum dump masking (optional)
+      6. Enrich with external catalogs (TIC, Gaia, ExoFOP) (optional)
       
     Parameters
     ----------
@@ -199,17 +219,35 @@ def ingest_mast_lightcurve_multi_sector(
         Whether to mask momentum dump cadences
     fits_file : str, optional
         Local FITS file path (bypasses MAST)
+    enable_gaia : bool
+        Enable Gaia DR3 catalog query (default True)
+    enable_tic : bool
+        Enable TIC v9 catalog query (default True)
+    enable_exofop : bool
+        Enable ExoFOP-TESS disposition query (default True)
         
     Returns
     -------
     LightCurveData
-        Stitched, detrended light curve data
+        Stitched, detrended light curve data with catalog enrichment
     """
+    # Apply config defaults if provided
+    if config is not None:
+        if max_sectors == 6:  # default value, override with config
+            max_sectors = config.mast.max_sectors
+        if enable_gaia is True:  # default value
+            enable_gaia = config.catalog.enable_gaia
+        if enable_tic is True:
+            enable_tic = config.catalog.enable_tic
+        if enable_exofop is True:
+            enable_exofop = config.catalog.enable_exofop
+    
     if fits_file is not None:
         return ingest_mast_lightcurve(
             target=target, mission=mission, quality=quality, sector=None,
             quarter=quarter, cadence_min=cadence_min, window_savgol=window_savgol,
-            poly_order=poly_order, sigma_clip=sigma_clip, fits_file=fits_file
+            poly_order=poly_order, sigma_clip=sigma_clip, fits_file=fits_file,
+            enable_gaia=enable_gaia, enable_tic=enable_tic, enable_exofop=enable_exofop,
         )
     
     # Search for all available sectors
@@ -362,7 +400,7 @@ def ingest_mast_lightcurve_multi_sector(
     }
     
     cadence_s = float(np.median(np.diff(cleaned_time))) * 86400.0 if cleaned_time.size > 1 else 60.0
-    return LightCurveData(
+    lc_data = LightCurveData(
         target=target,
         mission=mission.upper(),
         time=cleaned_time,
@@ -373,6 +411,11 @@ def ingest_mast_lightcurve_multi_sector(
         n_removed=int(n_removed),
         metadata=metadata,
     )
+    
+    # Enrich with external catalogs (TIC, Gaia, ExoFOP)
+    enrich_with_catalogs(lc_data, enable_gaia=enable_gaia, enable_tic=enable_tic, enable_exofop=enable_exofop)
+    
+    return lc_data
 
 __all__ = [
     "LightCurveData",
@@ -385,7 +428,178 @@ __all__ = [
     "sanitize_filename",
     "mask_momentum_dumps",
     "stitch_lightcurves",
+    "enrich_with_catalogs",
+    "run_batch_pipeline",
 ]
+
+
+# --------------------------------------------------------------------------
+# Batch Pipeline with Config & Database Integration
+# --------------------------------------------------------------------------
+
+def run_batch_pipeline(
+    tic_ids: List[str],
+    config: Anomaly9Config,
+    db: CandidateDB,
+    run_id: str,
+    skip_existing: bool = False,
+    max_workers: int = 1,
+    rate_limit: float = 1.0,
+    output_dir: Optional[Path] = None,
+    diagnostics_dir: Optional[Path] = None,
+) -> List[VettingReport]:
+    """
+    Run the full pipeline on multiple targets with config and database integration.
+    
+    Parameters
+    ----------
+    tic_ids : List[str]
+        List of TIC IDs to process.
+    config : Anomaly9Config
+        Configuration object.
+    db : CandidateDB
+        Database for persistence.
+    run_id : str
+        Unique run identifier.
+    skip_existing : bool
+        Skip TICs already in database.
+    max_workers : int
+        Number of parallel workers.
+    rate_limit : float
+        Delay between MAST queries (seconds).
+    output_dir : Path, optional
+        Output directory for results.
+    diagnostics_dir : Path, optional
+        Directory for diagnostic plots.
+    
+    Returns
+    -------
+    List[VettingReport]
+        List of vetting reports for successfully processed targets.
+    """
+    from anomaly9.detector import run_dual_detector
+    from anomaly9.vetting import vet_candidate
+    from anomaly9.catalog import get_stellar_density, get_stellar_radius, is_known_fp
+    from anomaly9.vetting import VettingReport
+    
+    if output_dir is None:
+        output_dir = Path(config.output.output_dir)
+    if diagnostics_dir is None:
+        diagnostics_dir = Path(config.output.diagnostics_dir)
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Filter out already processed targets if requested
+    if skip_existing:
+        filtered_ids = []
+        for tic_id in tic_ids:
+            existing = db.get_by_tic(tic_id)
+            if existing is None:
+                filtered_ids.append(tic_id)
+            else:
+                logger.info("Skipping %s: already in database (disposition: %s)", tic_id, existing.get("disposition"))
+        tic_ids = filtered_ids
+        logger.info("After --skip-existing filter: %d targets remaining", len(tic_ids))
+    
+    if not tic_ids:
+        logger.info("No targets to process")
+        return []
+    
+    # Log pipeline configuration
+    logger.info("Pipeline config: period_min=%.2f, period_max=%.2f, period_step=%.4f",
+                config.detector.period_min, config.detector.period_max, config.detector.period_step)
+    logger.info("Catalog matching: Gaia=%s, TIC=%s, ExoFOP=%s",
+                config.catalog.enable_gaia, config.catalog.enable_tic, config.catalog.enable_exofop)
+    
+    def process_target(tic_id: str) -> Optional[VettingReport]:
+        """Process a single target through the full pipeline."""
+        try:
+            logger.info("Processing %s", tic_id)
+            
+            # Ingest light curve
+            lc_data = ingest_mast_lightcurve_multi_sector(
+                target=tic_id,
+                max_sectors=config.mast.max_sectors,
+                window_savgol=120,
+                poly_order=3,
+                sigma_clip=6.0,
+                mask_momentum=True,
+                enable_gaia=config.catalog.enable_gaia,
+                enable_tic=config.catalog.enable_tic,
+                enable_exofop=config.catalog.enable_exofop,
+            )
+            
+            # Skip known false positives if configured
+            if is_known_fp(lc_data):
+                logger.info("Skipping %s: known false positive per ExoFOP", tic_id)
+                return None
+            
+            # Run dual detector
+            report = run_dual_detector(
+                data=lc_data,
+                period_min_d=config.detector.period_min,
+                period_max_d=config.detector.period_max,
+                period_step_d=config.detector.period_step,
+                contamination=config.detector.contamination,
+                z_window=config.detector.z_window,
+                bls_top_n=config.detector.bls_top_n,
+            )
+            
+            if report.bls_best is None:
+                logger.warning("No BLS detection for %s", tic_id)
+                return None
+            
+            # Run vetting on best BLS candidate
+            bls = report.bls_best
+            sector_str = str(lc_data.metadata.get("sector", "unknown"))
+            
+            stellar_density = get_stellar_density(lc_data)
+            stellar_radius = get_stellar_radius(lc_data)
+            
+            vetting_report = vet_candidate(
+                tic_id=tic_id,
+                sector=sector_str,
+                time=lc_data.time,
+                flux=lc_data.flux,
+                period=bls.period_d,
+                t0=bls.t0_bjd,
+                duration=bls.duration_d,
+                depth_ppm=bls.depth_ppm,
+                snr=bls.snr,
+                stellar_radius_rsun=stellar_radius,
+                stellar_density_gcc=stellar_density,
+            )
+            
+            # Persist to database
+            db.upsert_candidate(vetting_report, lc_data, run_id)
+            
+            return vetting_report
+            
+        except Exception as e:
+            logger.exception("Failed to process %s: %s", tic_id, e)
+            return None
+    
+    reports: List[VettingReport] = []
+    
+    if max_workers == 1:
+        for tic_id in tic_ids:
+            report = process_target(tic_id)
+            if report:
+                reports.append(report)
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(process_target, tic_id): tic_id for tic_id in tic_ids}
+            for future in as_completed(futures):
+                tic_id = futures[future]
+                try:
+                    report = future.result()
+                    if report:
+                        reports.append(report)
+                except Exception as e:
+                    logger.exception("Worker error for %s: %s", tic_id, e)
+    
+    return reports
 
 
 def _download_fits_chunked(url: str, cache_dir: Path, max_attempts: int = 3) -> Path:
@@ -530,6 +744,12 @@ def ingest_mast_lightcurve(
     poly_order: int = 3,
     sigma_clip: float = 6.0,
     fits_file: Optional[str] = None,
+    enable_gaia: bool = True,
+    enable_tic: bool = True,
+    enable_exofop: bool = True,
+    config: Optional[Anomaly9Config] = None,
+    db: Optional[CandidateDB] = None,
+    run_id: str = "",
 ) -> LightCurveData:
     """Full Phase-1 ingestion pipeline.
 
@@ -541,7 +761,71 @@ def ingest_mast_lightcurve(
       3. Clean: drop NaN/inf, negative flux, saturated & cosmic-ray flagged
          points; sigma-clip gross outliers.
       4. Normalize and detrend with a Savitzky-Golay filter.
+      5. Enrich with external catalogs (TIC, Gaia, ExoFOP) (optional).
+      
+    Parameters
+    ----------
+    target : str
+        TIC, KIC, or target identifier
+    mission : str
+        'TESS' or 'Kepler'
+    quality : str
+        Quality filter
+    sector : int, optional
+        TESS sector number
+    quarter : int, optional
+        Kepler quarter
+    cadence_min : int
+        Cadence in minutes (120 for 2-min, 1800 for 30-min)
+    window_savgol : int
+        Savitzky-Golay window
+    poly_order : int
+        Savitzky-Golay polynomial order
+    sigma_clip : float
+        Sigma clipping threshold
+    fits_file : str, optional
+        Local FITS file path (bypasses MAST)
+    enable_gaia : bool
+        Enable Gaia DR3 catalog query (default True)
+    enable_tic : bool
+        Enable TIC v9 catalog query (default True)
+    enable_exofop : bool
+        Enable ExoFOP-TESS disposition query (default True)
+    config : Anomaly9Config, optional
+        Configuration object (overrides individual parameters if provided)
+    db : CandidateDB, optional
+        Database for persistence
+    run_id : str
+        Associated run ID for database tracking
     """
+    # Apply config defaults if provided
+    if config is not None:
+        if enable_gaia is True:
+            enable_gaia = config.catalog.enable_gaia
+        if enable_tic is True:
+            enable_tic = config.catalog.enable_tic
+        if enable_exofop is True:
+            enable_exofop = config.catalog.enable_exofop
+    
+    if fits_file is not None:
+        lc = lk_read(fits_file)
+    else:
+        candidates = search_mast(target, mission)
+
+        # Pick the shortest sector (small FITS download, fast iteration).
+        if sector is not None:
+            candidates = [c for c in candidates if c.get("sector") == sector or c.get("quarter") == sector]
+            if not candidates:
+                raise LookupError(f"Requested sector/quarter {sector} not available for {target!r}.")
+        candidates.sort(key=lambda c: (c.get("cadence_min") or 1e9))
+        chosen = candidates[0]
+        logger.info(
+            "Selected: sector=%s quarter=%s (~%s min) url=%s",
+            chosen.get("sector"), chosen.get("quarter"), chosen.get("cadence_min"),
+            (chosen.get("download_url") or "")[:80],
+        )
+
+        mission_lower = mission.lower()
     if fits_file is not None:
         lc = lk_read(fits_file)
     else:
@@ -685,7 +969,7 @@ def ingest_mast_lightcurve(
     flux_norm = detrend_lightcurve(cleaned_time, cleaned_flux, window_savgol=window_savgol, poly_order=poly_order)
 
     cadence_s = float(np.median(np.diff(cleaned_time))) * 86400.0 if cleaned_time.size > 1 else 60.0
-    return LightCurveData(
+    lc_data = LightCurveData(
         target=target,
         mission=mission.upper(),
         time=cleaned_time,
@@ -696,6 +980,11 @@ def ingest_mast_lightcurve(
         n_removed=int(n_removed),
         metadata=metadata,
     )
+    
+    # Enrich with external catalogs (TIC, Gaia, ExoFOP)
+    enrich_with_catalogs(lc_data, enable_gaia=enable_gaia, enable_tic=enable_tic, enable_exofop=enable_exofop)
+    
+    return lc_data
 
 
 # --------------------------------------------------------------------------

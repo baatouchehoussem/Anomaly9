@@ -181,6 +181,7 @@ def duration_period_consistency(
     duration: float,
     depth_ppm: float,
     stellar_radius_rsun: Optional[float] = None,
+    stellar_density_gcc: Optional[float] = None,
 ) -> VettingCheckResult:
     """
     Duration-to-Period & Box-Shape Consistency Check.
@@ -199,6 +200,9 @@ def duration_period_consistency(
         Transit depth [ppm]
     stellar_radius_rsun : float, optional
         Stellar radius [Rsun] for physical consistency check
+    stellar_density_gcc : float, optional
+        Stellar density [g/cm^3] for physical duration prediction
+        using Seager & Mallen-Ornelas (2003) relation.
 
     Returns
     -------
@@ -211,15 +215,69 @@ def duration_period_consistency(
             passed=False,
             value=0.0,
             threshold=0.0,
-            description="Invalid period or duration",
+description="Invalid period or duration",
         )
 
+    dur_per_ratio = duration / period
+    
+    # Physical constants
+    G = 6.67430e-11  # m^3 kg^-1 s^-2
+    
+    if stellar_density_gcc is not None and stellar_density_gcc > 0:
+        # Use physical stellar density to compute expected duration
+        # From Seager & Mallen-Ornelas (2003):
+        # a/R* = (G * M* * P^2 / (4*pi^2 * R*^3))^(1/3) = (P^2 * G * rho* / (3*pi))^(1/3)
+        # For central transit (b=0): duration ~ (P/pi) * (R*/a)
+        # duration/period ~ (1/pi) * (R*/a) = 1 / (pi * a/R*)
+        
+        # Convert period to seconds
+        P_sec = period * 86400.0
+        # Convert density from g/cm^3 to kg/m^3
+        rho_kgm3 = stellar_density_gcc * 1000.0
+        
+        # Compute a/R* using the density relation
+        # a/R* = (P^2 * G * rho / (3*pi))^(1/3)
+        a_over_Rstar = (P_sec**2 * G * rho_kgm3 / (3.0 * np.pi))**(1.0/3.0)
+        
+        # Expected duration/period for central transit (b=0)
+        # duration/period = (1/pi) * (R*/a) = 1 / (pi * a/R*)
+        expected_dur_per_ratio = 1.0 / (np.pi * a_over_Rstar)
+        
+        # Allow factor of 2 variation (0.5x to 2x expected)
+        min_expected = 0.5 * expected_dur_per_ratio
+        max_expected = 2.0 * expected_dur_per_ratio
+        
+        passed = True
+        reasons = []
+        
+        if dur_per_ratio < min_expected:
+            passed = False
+            reasons.append(f"Duration/period {dur_per_ratio:.4f} < {min_expected:.4f} (0.5x expected from density rho*={stellar_density_gcc:.2f} g/cm3)")
+        elif dur_per_ratio > max_expected:
+            passed = False
+            reasons.append(f"Duration/period {dur_per_ratio:.4f} > {max_expected:.4f} (2x expected from density rho*={stellar_density_gcc:.2f} g/cm3)")
+        
+        # Also check for V-shape vs U-shape via depth/duration relation
+        depth_frac = depth_ppm / 1e6
+        if depth_frac > 0.01 and dur_per_ratio < 0.005:
+            passed = False
+            reasons.append(f"Deep ({depth_ppm:.0f} ppm) + short transit: grazing EB suspect")
+        
+        desc = "; ".join(reasons) if reasons else f"Duration/period: {dur_per_ratio:.4f} (expected {expected_dur_per_ratio:.4f} +/- factor 2 from rho*={stellar_density_gcc:.2f} g/cm3)"
+        
+        return VettingCheckResult(
+            name="duration_period_consistency",
+            passed=passed,
+            value=float(dur_per_ratio),
+            threshold=float(max_expected),
+            description=desc,
+        )
+    
+# Fallback to heuristic if no density provided
     # Expected duration for a central transit around a Sun-like star
-    # Using approximate relation: duration ~ (P/π) * (R_star/a) * sqrt(1-b^2)
+    # Using approximate relation: duration ~ (P/pi) * (R_star/a) * sqrt(1-b^2)
     # For circular orbit: a ~ (P^2)^(1/3) in AU (for 1 Msun)
     # Simplified: duration/period ~ 0.01 - 0.1 for typical planets
-    
-    dur_per_ratio = duration / period
     
     # Physical limits: 
     # - Minimum duration for a grazing transit: ~0.1% of period (very short)
@@ -247,7 +305,7 @@ def duration_period_consistency(
         passed = False
         reasons.append(f"Deep ({depth_ppm:.0f} ppm) + short transit: grazing EB suspect")
     
-    desc = "; ".join(reasons) if reasons else f"Duration/period ratio: {dur_per_ratio:.4f} (OK)"
+    desc = "; ".join(reasons) if reasons else f"Duration/period ratio: {dur_per_ratio:.4f} (OK, heuristic limits {min_ratio}-{max_ratio})"
     
     return VettingCheckResult(
         name="duration_period_consistency",
@@ -407,7 +465,7 @@ def momentum_dump_proximity(
         TESS sector number for known dump cadences
     cadence_tolerance : float
         Time tolerance [days] for proximity flag
-    
+     
     Returns
     -------
     VettingCheckResult
@@ -663,13 +721,14 @@ def run_all_checks(
     depth_ppm: float,
     sector: Optional[int] = None,
     stellar_radius_rsun: Optional[float] = None,
+    stellar_density_gcc: Optional[float] = None,
 ) -> List[VettingCheckResult]:
     """
     Run all vetting checks and return list of results.
     """
     checks = [
         odd_even_depth_test(time, flux, period, t0, duration),
-        duration_period_consistency(period, duration, depth_ppm, stellar_radius_rsun),
+        duration_period_consistency(period, duration, depth_ppm, stellar_radius_rsun, stellar_density_gcc),
         transit_shape_boxiness(time, flux, period, t0, duration),
         momentum_dump_proximity(time, flux, period, t0, duration, sector),
         signal_to_pink_noise_ratio(time, flux, period, t0, duration),

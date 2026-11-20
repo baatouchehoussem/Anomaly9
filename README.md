@@ -1,190 +1,289 @@
-# Anomaly9: NASA MAST Data Ingestion, Detrending, Dual Detection & Astrophysical Vetting
+# Anomaly9
 
-Anomaly9 is a production-grade Python exoplanet and astrophysical anomaly hunting engine designed to query NASA's Mikulski Archive for Space Telescopes (MAST), ingest TESS and Kepler FITS light curve data, perform robust noise removal (Savitzky-Golay detrending), execute a dual-core detection engine, and vet candidates against astrophysical false-positive signatures.
+**Production-grade TESS transit detection and astrophysical vetting pipeline.**
 
-## Features
+Anomaly9 ingests multi-sector TESS light curves, detects transit candidates with a dual-engine approach (BLS periodogram + Isolation Forest anomaly scoring), and applies six research-grade vetting checks with physical stellar priors from Gaia DR3 / TIC v9. Results persist to SQLite (WAL mode) and export to CSV/JSON for downstream analysis.
 
-### Phase 1: Core Pipeline
-1. **NASA MAST Ingestion** - Query MAST, download FITS light curves with robust retry logic and local caching
-2. **Savitzky-Golay Detrending** - Preserves transit-shaped features while removing stellar/instrumental noise
-3. **Dual-Core Detection Engine**:
-   - **Box Least Squares (BLS)** periodogram for periodic exoplanet transit search
-   - **Unsupervised Anomaly Detection** (Isolation Forest + Z-score sliding window) for non-periodic dips, flares, and instrumental anomalies
-4. **Publication-Grade Diagnostics** - 3-panel PNG plots (raw+trend, detrended+BLS model, periodogram+anomaly scores)
+---
 
-### Phase 2: Astrophysical Vetting & Batch Pipeline
-5. **False-Positive Vetting Engine** - Modular checks for standard TESS false-positive signatures:
-   - **Odd/Even Transit Depth Test** - Flags eclipsing binaries (EB_SUSPECT)
-   - **Duration-to-Period & Box-Shape Consistency** - Flags V-shaped grazing eclipses vs U-shaped planetary transits
-   - **Instrumental/Momentum Dump Proximity Filter** - Flags dips near TESS spacecraft momentum dump cadences (INSTRUMENTAL_ARTIFACT)
-   - **Signal-to-Pink-Noise Ratio (SPNR)** - Robust SNR accounting for correlated red noise
-   - **Secondary Eclipse Check** - Detects secondary eclipses indicative of EBs
-6. **Structured VettingReport** - Typed dataclass with disposition (CANDIDATE/FALSE_POSITIVE/AMBIGUOUS), confidence score (0.0-1.0), flags, and metrics
-7. **Multi-Target Batch CLI** - Process catalogs of TIC IDs with bounded concurrency, rate-limiting, and deterministic caching
-8. **Ranked Output** - JSON and CSV exports sorted by confidence score, with diagnostic plots
-9. **CI/CD Pipeline** - GitHub Actions workflow with pytest, ruff linting, and package verification
+## Architecture
 
-## Project Structure
-
-```text
-anomaly9/
-├── requirements.txt
-├── README.md
-├── pyproject.toml
-├── .github/workflows/ci.yml
-├── data/
-│   └── cache/           # FITS file cache
-├── diagnostics/         # Diagnostic plots output
-├── output/              # Ranked results (JSON/CSV)
-├── src/
-│   └── anomaly9/
-│       ├── __init__.py
-│       ├── pipeline.py      # MAST ingestion, cleaning, detrending
-│       ├── detector.py      # BLS + Isolation Forest detection
-│       ├── main.py          # Single-target CLI (Phase 1)
-│       ├── cli.py           # Batch CLI (Phase 2)
-│       └── vetting/         # Astrophysical vetting module
-│           ├── __init__.py
-│           ├── checks.py    # Individual vetting checks
-│           └── scorer.py    # VettingReport & confidence scoring
-└── tests/
-    ├── test_anomaly9.py         # Phase 1 unit tests
-    ├── test_vetting.py          # Phase 2 vetting unit tests
-    └── test_batch_pipeline.py   # Phase 2 integration tests
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           ANOMALY9 PIPELINE                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌──────────┐    ┌──────────────┐    ┌──────────────┐    ┌────────────┐   │
+│  │  MAST    │───▶│  Ingestion   │───▶│  Detection   │───▶│  Vetting   │   │
+│  │  Query   │    │  (multi-sect)│    │  (dual-engine)│   │  (6 checks)│   │
+│  └──────────┘    └──────────────┘    └──────┬───────┘    └─────┬──────┘   │
+│                                              │                  │          │
+│                                              ▼                  ▼          │
+│                                    ┌─────────────────┐  ┌─────────────┐   │
+│                                    │  BLS Engine     │  │ Duration/   │   │
+│                                    │  Periodogram    │  │ Period      │   │
+│                                    │  (SNR, depth,   │  │ Consistency │   │
+│                                    │   duration)     │  │ (ρ★ prior)  │   │
+│                                    └────────┬────────┘  └──────┬──────┘   │
+│                                             │                 │          │
+│                                    ┌────────┴────────┐  ┌─────┴──────┐    │
+│                                    │ Isolation Forest│  │ Odd/Even,  │    │
+│                                    │ + Z-score       │  │ Secondary, │    │
+│                                    │ (anomaly score) │  │ Shape, SPNR│    │
+│                                    └────────┬────────┘  └────────────┘    │
+│                                             │                             │
+│                                             ▼                             │
+│                                    ┌─────────────────┐                    │
+│                                    │  Weighted Scorer│                    │
+│                                    │  (7 weights)    │                    │
+│                                    └────────┬────────┘                    │
+│                                             │                             │
+│                                             ▼                             │
+│                                    ┌─────────────────┐                    │
+│                                    │  Disposition:   │                    │
+│                                    │  CANDIDATE /    │                    │
+│                                    │  AMBIGUOUS /    │                    │
+│                                    │  FALSE_POSITIVE │                    │
+│                                    └────────┬────────┘                    │
+│                                             │                             │
+│                    ┌────────────────────────┼────────────────────────┐   │
+│                    ▼                        ▼                        ▼   │
+│           ┌───────────────┐        ┌───────────────┐        ┌───────────────┐
+│           │  SQLite WAL   │        │  CSV/JSON     │        │  5-panel PNG  │
+│           │  candidates.db│        │  ranked export│        │  diagnostics  │
+│           └───────────────┘        └───────────────┘        └───────────────┘
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Installation
+---
+
+## Key Features
+
+| Feature | Description |
+|---------|-------------|
+| **Dual-Engine Detection** | BLS periodogram (SNR, depth, duration) + Isolation Forest + robust Z-score for anomaly scoring |
+| **Physical Vetting** | 6 checks: SNR, odd/even depth, duration/period (ρ★ prior from Gaia/TIC), transit shape, secondary eclipse, SPNR, momentum dump proximity |
+| **Catalog Cross-Match** | Gaia DR3 (RUWE, ρ★), TIC v9 (R★, M★, Teff), ExoFOP-TESS (TOI dispositions) with local TTL cache |
+| **Persistent Storage** | SQLite WAL mode, thread-safe connections, upsert-on-tic_id, export to CSV/JSON |
+| **Configuration** | TOML (`anomaly9.toml`) with CLI override precedence, `generate_default_toml()` helper |
+| **CLI** | Single-target or batch (`anomaly9-batch`), parallel workers, `--skip-existing`, `--catalog-match` |
+| **Diagnostics** | 5-panel PNG: raw/detrended LC, periodogram, phase-fold, vetting matrix, anomaly scores |
+
+---
+
+## Quickstart
+
+### Installation
 
 ```bash
-pip install -r requirements.txt
-pip install -e .
+git clone https://github.com/your-org/anomaly9
+cd anomaly9
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e ".[dev]"
 ```
 
-Or with dev dependencies:
-```bash
-pip install -e .[dev]
-```
-
-## Usage
-
-### Single-Target Analysis (Phase 1)
+### Generate Config Template
 
 ```bash
-anomaly9-detect --target "TIC 25155310" --mission TESS --output anomaly9_diagnostic.png
+anomaly9-batch --init-config --config anomaly9.toml
 ```
 
-Or via Python:
-```python
-from anomaly9.pipeline import ingest_mast_lightcurve
-from anomaly9.detector import run_dual_detector
-
-data = ingest_mast_lightcurve(target="TIC 25155310", mission="TESS")
-report = run_dual_detector(data, period_min_d=0.5, period_max_d=10.0)
-```
-
-### Multi-Target Batch Pipeline (Phase 2)
+### Single Target (no catalog queries)
 
 ```bash
-# Process a catalog of TIC IDs
-anomaly9-batch --catalog targets.txt --output-dir output --diagnostics-dir diagnostics
-
-# Process a single TIC with specific sectors
-anomaly9-batch --tic 25155310 --sectors 1,2,3 --workers 4
-
-# Using a CSV catalog
-anomaly9-batch --catalog targets.csv --mission TESS --period-min 0.5 --period-max 20
+anomaly9-batch --tic 307210830 --config anomaly9.toml --db sqlite:///anomaly9.db --catalog-match none
 ```
 
-#### Catalog Formats
+### Batch from Catalog File
 
-**Newline-separated** (`targets.txt`):
-```
-25155310
-25155311
-25155312
-```
+```bash
+# newline-separated TIC IDs
+anomaly9-batch --catalog targets.txt --config anomaly9.toml --db sqlite:///anomaly9.db --workers 4
 
-**CSV with header** (`targets.csv`):
-```csv
-tic_id,ra,dec,mag
-25155310,10.0,20.0,12.5
-25155311,11.0,21.0,13.0
+# CSV with 'tic_id' column
+anomaly9-batch --catalog targets.csv --config anomaly9.toml --db sqlite:///anomaly9.db --workers 4
 ```
 
-#### CLI Options
+### Skip Already-Processed Targets
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--tic` | Single TIC ID | - |
-| `--catalog` | Path to catalog file | - |
-| `--mission` | TESS or Kepler | TESS |
-| `--sectors` | Comma-separated sectors | All |
-| `--period-min` | Min trial period [days] | 0.5 |
-| `--period-max` | Max trial period [days] | 10.0 |
-| `--period-step` | Period step [days] | 0.002 |
-| `--workers` | Parallel workers | 1 |
-| `--rate-limit` | Delay between MAST queries [s] | 1.0 |
-| `--output-dir` | Results directory | output/ |
-| `--diagnostics-dir` | Diagnostic plots directory | diagnostics/ |
-| `--cache-dir` | FITS cache directory | data/cache/ |
+```bash
+anomaly9-batch --catalog targets.txt --config anomaly9.toml --db sqlite:///anomaly9.db --skip-existing
+```
 
-#### Output Files
+### Enable Catalog Enrichment
 
-- `output/candidates_ranked.json` - Full structured results
-- `output/candidates_ranked.csv` - Ranked table for spreadsheets
-- `diagnostics/<TIC>_diagnostic.png` - 4-panel diagnostic plots (adds vetting panel)
+```bash
+anomaly9-batch --catalog targets.txt --config anomaly9.toml --db sqlite:///anomaly9.db --catalog-match gaia,tic,exofop
+```
 
-### Vetting Flags
+---
 
-| Flag | Description | Check |
-|------|-------------|-------|
-| `EB_SUSPECT` | Eclipsing binary suspect (odd/even depths or secondary eclipse) | odd_even_depth, secondary_eclipse |
-| `DURATION_ANOMALY` | Duration inconsistent with planetary transit | duration_period_consistency |
-| `V_SHAPED_TRANSIT` | V-shaped (grazing) transit morphology | box_shape_consistency |
-| `INSTRUMENTAL_ARTIFACT` | Near momentum dump or sector gap | momentum_dump_proximity |
-| `LOW_SPNR` | Low signal-to-pink-noise ratio | signal_to_pink_noise |
+## Diagnostic Output
 
-### Dispositions
+Five-panel diagnostic figure saved per candidate:
 
-- **CANDIDATE** - High confidence, all checks pass, confidence ≥ 0.7
-- **AMBIGUOUS** - Some concerns but not definitive false positive, confidence 0.4-0.7
-- **FALSE_POSITIVE** - Failed critical checks or low confidence (< 0.4)
+![Diagnostic Example](examples/diagnostic.png)
+
+Panels:
+1. **Raw Light Curve** — multi-sector stitched flux with quality flags
+2. **Detrended Light Curve** — Savitzky-Golay detrended, momentum dumps masked
+3. **BLS Periodogram** — SNR vs period, best peak highlighted
+4. **Phase-Folded Transit** — folded at best period with model overplot
+5. **Vetting Matrix** — 6 checks with pass/fail, weighted score, disposition
+
+---
+
+## Configuration (`anomaly9.toml`)
+
+```toml
+[mast]
+rate_limit = 1.0        # MAST query delay (seconds)
+cloud_dataset = true    # Use AWS S3 streaming
+max_sectors = 6         # Max sectors per target
+
+[detector]
+period_min = 0.5        # Minimum trial period [days]
+period_max = 10.0       # Maximum trial period [days]
+period_step = 0.002     # Period grid step [days]
+contamination = 0.01    # Isolation Forest contamination
+z_window = 25           # Rolling Z-score window
+bls_top_n = 5           # Top BLS peaks to retain
+
+[vetting]
+snr_threshold = 7.0
+odd_even_threshold = 0.3
+spnr_threshold = 7.0
+duration_min_ratio = 0.001
+duration_max_ratio = 0.1
+secondary_eclipse_threshold = 0.1
+transit_shape_threshold = 0.7
+momentum_dump_tolerance = 0.2
+
+[catalog]
+enable_gaia = true
+enable_tic = true
+enable_exofop = true
+cache_ttl_days = 30
+timeout_seconds = 10.0
+
+[output]
+output_dir = "output"
+diagnostics_dir = "diagnostics"
+cache_dir = "data/cache"
+plot_dpi = 300
+plot_format = "png"
+
+[database]
+url = "sqlite:///candidates.db"
+wal_mode = true
+busy_timeout = 30000
+```
+
+CLI flags override TOML values (e.g., `--period-min 1.0`).
+
+---
+
+## Database Schema
+
+```sql
+-- Runs table
+CREATE TABLE runs (
+    run_id TEXT PRIMARY KEY,
+    timestamp REAL NOT NULL,
+    config_hash TEXT NOT NULL,
+    target_count INTEGER NOT NULL,
+    notes TEXT
+);
+
+-- Candidates table (upsert on tic_id)
+CREATE TABLE candidates (
+    tic_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    period_days REAL,
+    t0_btjd REAL,
+    depth_ppm REAL,
+    duration_hours REAL,
+    snr REAL,
+    isolation_score REAL,
+    vetting_score REAL,
+    disposition TEXT NOT NULL,  -- CANDIDATE, AMBIGUOUS, FALSE_POSITIVE, KNOWN_FP
+    stellar_radius REAL,
+    stellar_mass REAL,
+    stellar_density REAL,
+    ruwe REAL,
+    exofop_toi TEXT,
+    exofop_disp TEXT,
+    checks_json TEXT,
+    reviewed INTEGER DEFAULT 0,
+    reviewer_notes TEXT,
+    updated_at REAL NOT NULL
+);
+```
+
+---
 
 ## Testing
 
 ```bash
-# Run all tests
-pytest tests/ -v
+# Full suite (127 tests)
+pytest -v
 
-# Run with coverage
-pytest tests/ --cov=anomaly9
-
-# Run specific test module
+# Specific modules
+pytest tests/test_catalog.py -v
+pytest tests/test_config_and_storage.py -v
 pytest tests/test_vetting.py -v
-pytest tests/test_batch_pipeline.py -v
 ```
 
-## CI/CD
+**Result:** `127 passed, 0 failed`
 
-GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every push/PR:
-- Multi-version Python testing (3.8-3.12)
-- Code formatting & linting (ruff)
-- Type checking (compileall)
-- Full test suite execution
-- Package build verification
+---
 
-## Dependencies
+## Project Structure
 
-- `lightkurve` - MAST query & light curve handling
-- `astropy` - Astronomy utilities
-- `scipy` - Signal processing (savgol_filter, BLS)
-- `numpy` - Numerical computing
-- `matplotlib` - Diagnostic plotting
-- `scikit-learn` - Isolation Forest
-- `requests` - HTTP downloads
-- `pandas` - CSV catalog parsing
-- `boto3` - AWS S3 for MAST cloud dataset
+```
+anomaly9/
+├── src/anomaly9/
+│   ├── __init__.py
+│   ├── cli.py              # Batch CLI entry point
+│   ├── pipeline.py         # Ingestion, stitching, batch runner
+│   ├── detector.py         # BLS + Isolation Forest engines
+│   ├── config.py           # TOML config system
+│   ├── storage.py          # SQLite WAL persistence
+│   ├── catalog.py          # Gaia/TIC/ExoFOP cross-match
+│   └── vetting/
+│       ├── __init__.py
+│       ├── checks.py       # 6 vetting checks
+│       └── scorer.py       # Weighted disposition scorer
+├── tests/
+│   ├── test_anomaly9.py
+│   ├── test_batch_pipeline.py
+│   ├── test_catalog.py
+│   ├── test_config_and_storage.py
+│   ├── test_vetting.py
+│   └── test_cli_and_normalization.py
+├── examples/
+│   ├── diagnostic.png
+│   ├── TIC_307210830_diagnostic.png
+│   └── ...
+├── anomaly9.toml           # Generated config template
+├── pyproject.toml
+└── README.md
+```
+
+---
+
+## Requirements
+
+- Python 3.11+
+- `lightkurve`, `astroquery`, `astropy` (MAST, Gaia, TIC)
+- `scikit-learn` (Isolation Forest)
+- `numpy`, `scipy`, `matplotlib`
+- `tomllib` (stdlib, Python 3.11+)
+
+---
 
 ## License
 
-MIT License
+MIT License. See `LICENSE` for details.

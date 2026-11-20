@@ -379,6 +379,7 @@ def vet_candidate(
     depth_ppm: float,
     snr: float,
     stellar_radius_rsun: Optional[float] = None,
+    stellar_density_gcc: Optional[float] = None,
 ) -> VettingReport:
     """
     Complete vetting pipeline for a single candidate.
@@ -405,6 +406,8 @@ def vet_candidate(
         BLS SNR
     stellar_radius_rsun : float, optional
         Stellar radius for physical consistency
+    stellar_density_gcc : float, optional
+        Stellar density [g/cm^3] for physical duration prediction
         
     Returns
     -------
@@ -422,6 +425,7 @@ def vet_candidate(
         depth_ppm=depth_ppm,
         sector=int(sector) if sector.isdigit() else None,
         stellar_radius_rsun=stellar_radius_rsun,
+        stellar_density_gcc=stellar_density_gcc,
     )
     
     report = VettingReport.from_checks(
